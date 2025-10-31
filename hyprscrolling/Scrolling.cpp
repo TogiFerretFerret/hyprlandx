@@ -275,7 +275,7 @@ SP<SColumnData> SWorkspaceData::atCenter() {
 void SWorkspaceData::recalculate(bool forceInstant) {
     static const auto PFSONONE = CConfigValue<Hyprlang::INT>("plugin:hyprscrolling:fullscreen_on_one_column");
 
-    if (!workspace || !workspace) {
+    if (!workspace) {
         Debug::log(ERR, "[scroller] broken internal state on workspace data");
         return;
     }
@@ -329,9 +329,13 @@ bool SWorkspaceData::visible(SP<SColumnData> c) {
     const auto USABLE    = layout->usableAreaFor(workspace->m_monitor.lock());
     float      totalLeft = 0;
     for (const auto& col : columns) {
-        if (col == c)
-            return (totalLeft >= leftOffset && totalLeft < leftOffset + USABLE.w) ||
-                (totalLeft + col->columnWidth * USABLE.w >= leftOffset && totalLeft + col->columnWidth * USABLE.w < leftOffset + USABLE.w);
+        if (col == c) {
+            const float colLeft   = totalLeft;
+            const float colRight  = totalLeft + col->columnWidth * USABLE.w;
+            const float viewLeft  = leftOffset;
+            const float viewRight = leftOffset + USABLE.w;
+            return colLeft < viewRight && viewLeft < colRight;
+        }
 
         totalLeft += col->columnWidth * USABLE.w;
     }
@@ -362,8 +366,8 @@ void CScrollingLayout::applyNodeDataToWindow(SP<SScrollingWindowData> data, bool
     }
 
     // for gaps outer
-    const bool DISPLAYLEFT   = !hasWindowsLeft && STICKS(data->layoutBox.x, PMONITOR->m_position.x + PMONITOR->m_reservedTopLeft.x);
-    const bool DISPLAYRIGHT  = !hasWindowsRight && STICKS(data->layoutBox.x + data->layoutBox.w, PMONITOR->m_position.x + PMONITOR->m_size.x - PMONITOR->m_reservedBottomRight.x);
+    const bool DISPLAYLEFT   = !hasWindowsLeft;
+    const bool DISPLAYRIGHT  = !hasWindowsRight;
     const bool DISPLAYTOP    = STICKS(data->layoutBox.y, PMONITOR->m_position.y + PMONITOR->m_reservedTopLeft.y);
     const bool DISPLAYBOTTOM = STICKS(data->layoutBox.y + data->layoutBox.h, PMONITOR->m_position.y + PMONITOR->m_size.y - PMONITOR->m_reservedBottomRight.y);
 
@@ -776,28 +780,49 @@ void CScrollingLayout::fullscreenRequestForWindow(PHLWINDOW pWindow, const eFull
     g_pCompositor->changeWindowZOrder(pWindow, true);
 }
 
+void CScrollingLayout::focusWindowUpdate(PHLWINDOW pWindow) {
+    if (!validMapped(pWindow)) {
+        g_pCompositor->focusWindow(nullptr);
+        return;
+    }
+    g_pCompositor->focusWindow(pWindow);
+    const auto WINDOWDATA = dataFor(pWindow);
+    if (WINDOWDATA) {
+        if (auto col = WINDOWDATA->column.lock())
+            col->lastFocusedWindow = WINDOWDATA;
+    }
+}
+
 SP<SScrollingWindowData> CScrollingLayout::findBestNeighbor(SP<SScrollingWindowData> pCurrent, SP<SColumnData> pTargetCol) {
     if (!pCurrent || !pTargetCol || pTargetCol->windowDatas.empty())
         return nullptr;
 
-    const double             currentTop    = pCurrent->layoutBox.y;
-    const double             currentBottom = pCurrent->layoutBox.y + pCurrent->layoutBox.h;
-    SP<SScrollingWindowData> bestMatch     = nullptr;
-
+    const double                          currentTop    = pCurrent->layoutBox.y;
+    const double                          currentBottom = pCurrent->layoutBox.y + pCurrent->layoutBox.h;
+    std::vector<SP<SScrollingWindowData>> overlappingWindows;
     for (const auto& candidate : pTargetCol->windowDatas) {
         const double candidateTop    = candidate->layoutBox.y;
         const double candidateBottom = candidate->layoutBox.y + candidate->layoutBox.h;
+        const bool   overlaps        = (candidateTop < currentBottom) && (candidateBottom > currentTop);
 
-        const bool   overlaps = (candidateTop < currentBottom) && (candidateBottom > currentTop);
-
-        if (overlaps && (!bestMatch || candidateTop < bestMatch->layoutBox.y))
-            bestMatch = candidate;
+        if (overlaps)
+            overlappingWindows.emplace_back(candidate);
     }
+    if (!overlappingWindows.empty()) {
+        auto lastFocused = pTargetCol->lastFocusedWindow.lock();
 
-    if (!bestMatch && !pTargetCol->windowDatas.empty())
+        if (lastFocused) {
+            auto it = std::ranges::find(overlappingWindows, lastFocused);
+            if (it != overlappingWindows.end())
+                return lastFocused;
+        }
+
+        auto topmost = std::ranges::min_element(overlappingWindows, std::less<>{}, [](const SP<SScrollingWindowData>& w) { return w->layoutBox.y; });
+        return *topmost;
+    }
+    if (!pTargetCol->windowDatas.empty())
         return pTargetCol->windowDatas.front();
-
-    return bestMatch;
+    return nullptr;
 }
 
 std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::string message) {
@@ -825,14 +850,14 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                 // move to max
                 DATA->leftOffset = DATA->maxWidth();
                 DATA->recalculate();
-                g_pCompositor->focusWindow(nullptr);
+                focusWindowUpdate(nullptr);
                 return {};
             }
 
             centerOrFit(DATA, COL);
             DATA->recalculate();
 
-            g_pCompositor->focusWindow(COL->windowDatas.front()->window.lock());
+            focusWindowUpdate(COL->windowDatas.front()->window.lock());
             g_pCompositor->warpCursorTo(COL->windowDatas.front()->window.lock()->middle());
 
             return {};
@@ -842,7 +867,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                 if (DATA->leftOffset <= DATA->maxWidth() && DATA->columns.size() > 0) {
                     DATA->centerCol(DATA->columns.back());
                     DATA->recalculate();
-                    g_pCompositor->focusWindow((DATA->columns.back()->windowDatas.back())->window.lock());
+                    focusWindowUpdate((DATA->columns.back()->windowDatas.back())->window.lock());
                     g_pCompositor->warpCursorTo((DATA->columns.back()->windowDatas.back())->window.lock()->middle());
                 }
 
@@ -856,7 +881,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
             centerOrFit(DATA, COL);
             DATA->recalculate();
 
-            g_pCompositor->focusWindow(COL->windowDatas.back()->window.lock());
+            focusWindowUpdate(COL->windowDatas.back()->window.lock());
             g_pCompositor->warpCursorTo(COL->windowDatas.front()->window.lock()->middle());
 
             return {};
@@ -872,7 +897,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
 
         const auto ATCENTER = DATA->atCenter();
 
-        g_pCompositor->focusWindow(ATCENTER ? (*ATCENTER->windowDatas.begin())->window.lock() : nullptr);
+        focusWindowUpdate(ATCENTER ? (*ATCENTER->windowDatas.begin())->window.lock() : nullptr);
     } else if (ARGS[0] == "colresize") {
         const auto WDATA = dataFor(g_pCompositor->m_lastWindow.lock());
 
@@ -895,7 +920,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
 
         CScopeGuard x([WDATA] {
             WDATA->column->columnWidth = std::clamp(WDATA->column->columnWidth, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
-            WDATA->column->workspace->fitCol(WDATA->column.lock());
+            WDATA->column->workspace->centerOrFitCol(WDATA->column.lock());
             WDATA->column->workspace->recalculate();
         });
 
@@ -1103,7 +1128,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                         PREV = WDATA->column->windowDatas.back();
                 }
 
-                g_pCompositor->focusWindow(PREV->window.lock());
+                focusWindowUpdate(PREV->window.lock());
                 g_pCompositor->warpCursorTo(PREV->window.lock()->middle());
                 break;
             }
@@ -1118,7 +1143,7 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                         NEXT = WDATA->column->windowDatas.front();
                 }
 
-                g_pCompositor->focusWindow(NEXT->window.lock());
+                focusWindowUpdate(NEXT->window.lock());
                 g_pCompositor->warpCursorTo(NEXT->window.lock()->middle());
                 break;
             }
@@ -1136,10 +1161,12 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                 }
 
                 auto pTargetWindowData = findBestNeighbor(WDATA, PREV);
-                g_pCompositor->focusWindow(pTargetWindowData->window.lock());
-                centerOrFit(WDATA->column->workspace.lock(), PREV);
-                WDATA->column->workspace->recalculate();
-                g_pCompositor->warpCursorTo(PREV->windowDatas.front()->window.lock()->middle());
+                if (pTargetWindowData) {
+                    focusWindowUpdate(pTargetWindowData->window.lock());
+                    centerOrFit(WDATA->column->workspace.lock(), PREV);
+                    WDATA->column->workspace->recalculate();
+                    g_pCompositor->warpCursorTo(pTargetWindowData->window.lock()->middle());
+                }
                 break;
             }
 
@@ -1156,10 +1183,12 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
                 }
 
                 auto pTargetWindowData = findBestNeighbor(WDATA, NEXT);
-                g_pCompositor->focusWindow(pTargetWindowData->window.lock());
-                centerOrFit(WDATA->column->workspace.lock(), NEXT);
-                WDATA->column->workspace->recalculate();
-                g_pCompositor->warpCursorTo(NEXT->windowDatas.front()->window.lock()->middle());
+                if (pTargetWindowData) {
+                    focusWindowUpdate(pTargetWindowData->window.lock());
+                    centerOrFit(WDATA->column->workspace.lock(), NEXT);
+                    WDATA->column->workspace->recalculate();
+                    g_pCompositor->warpCursorTo(pTargetWindowData->window.lock()->middle());
+                }
                 break;
             }
 
@@ -1315,6 +1344,66 @@ std::any CScrollingLayout::layoutMessage(SLayoutMessageHeader header, std::strin
 
         g_pCompositor->focusWindow(windowsToMove.front());
         g_pCompositor->warpCursorTo(windowsToMove.front()->middle());
+    } else if (ARGS[0] == "togglefit") {
+        static const auto PFITMETHOD = CConfigValue<Hyprlang::INT>("plugin:hyprscrolling:focus_fit_method");
+        auto&             fitMethod  = *PFITMETHOD.ptr();
+        const int         toggled    = fitMethod ^ 1;
+
+        fitMethod = toggled;
+
+        const auto        focusedData = dataFor(g_pCompositor->m_lastWindow.lock());
+        static const auto PFSONONE    = CConfigValue<Hyprlang::INT>("plugin:hyprscrolling:fullscreen_on_one_column");
+
+        for (const auto& ws : m_workspaceDatas) {
+            if (!ws || ws->columns.empty())
+                continue;
+
+            const auto monitor = ws->workspace->m_monitor.lock();
+            if (!monitor)
+                continue;
+
+            const auto USABLE = usableAreaFor(monitor);
+
+            const auto focusedColumn = (focusedData && focusedData->column && focusedData->column->workspace.lock() == ws) ? focusedData->column.lock() : nullptr;
+
+            const auto fallbackColumn = ws->atCenter();
+
+            if (toggled == 1) {
+                const auto columnToFit = focusedColumn ? focusedColumn : fallbackColumn;
+                if (!columnToFit)
+                    continue;
+
+                double currentLeft = 0.0;
+                for (const auto& col : ws->columns) {
+                    const double itemWidth = *PFSONONE && ws->columns.size() == 1 ? USABLE.w : USABLE.w * col->columnWidth;
+
+                    if (col == columnToFit) {
+                        const double colLeft   = currentLeft;
+                        const double colRight  = currentLeft + itemWidth;
+                        const double scrollMax = std::max(ws->maxWidth() - USABLE.w, 0.0);
+                        double       desiredOffset;
+
+                        if (col == ws->columns.front())
+                            desiredOffset = 0.0;
+                        else
+                            desiredOffset = std::clamp(colRight - USABLE.w, 0.0, scrollMax);
+
+                        ws->leftOffset = desiredOffset;
+                        break;
+                    }
+
+                    currentLeft += itemWidth;
+                }
+            } else {
+                const auto columnToCenter = focusedColumn ? focusedColumn : fallbackColumn;
+                if (!columnToCenter)
+                    continue;
+
+                ws->centerCol(columnToCenter);
+            }
+
+            ws->recalculate();
+        }
     }
     return {};
 }
@@ -1324,7 +1413,20 @@ SWindowRenderLayoutHints CScrollingLayout::requestRenderHints(PHLWINDOW a) {
 }
 
 void CScrollingLayout::switchWindows(PHLWINDOW a, PHLWINDOW b) {
-    ;
+    const auto DATA1 = dataFor(a);
+    const auto DATA2 = dataFor(b);
+
+    std::swap(DATA1->window, DATA2->window);
+
+    const auto WS1 = DATA1->column->workspace.lock();
+    const auto WS2 = DATA2->column->workspace.lock();
+
+    WS1->recalculate();
+
+    if (WS1 == WS2)
+        return;
+
+    WS2->recalculate();
 }
 
 void CScrollingLayout::moveWindowTo(PHLWINDOW w, const std::string& dir, bool silent) {
@@ -1375,6 +1477,7 @@ void CScrollingLayout::moveWindowTo(PHLWINDOW w, const std::string& dir, bool si
         DATA->column->down(DATA);
 
     WS->recalculate();
+    focusWindowUpdate(w);
     g_pCompositor->warpCursorTo(w->middle());
 }
 
